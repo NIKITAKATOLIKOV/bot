@@ -41,8 +41,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
         ydl_opts = {
             "outtmpl": out_template,
-            "format": "best",
-            "format_sort": ["res", "fps", "vcodec:h264", "quality"],
+            "format": "best[format_id!*=download]/best",
+            "format_sort": ["res", "tbr", "quality"],
             "quiet": True,
             "no_warnings": True,
         }
