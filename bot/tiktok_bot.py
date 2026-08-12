@@ -1,7 +1,7 @@
 import os
 import logging
 import tempfile
-import requests
+import yt_dlp
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -10,7 +10,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from snaptik_scraper import fetch_download_links
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,35 +35,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Это не похоже на ссылку TikTok 🤔")
         return
 
-    status_msg = await update.message.reply_text("Ищу ссылку на видео через snaptik...")
-
-    try:
-        links = fetch_download_links(text)
-        # берём первую найденную ссылку (обычно это самое высокое качество без вотемарки)
-        video_url = links[0]["url"]
-    except Exception as e:
-        logger.exception("Ошибка получения ссылки со snaptik")
-        await status_msg.edit_text(f"Не получилось получить ссылку со snaptik 😔\n{e}")
-        return
-
-    await status_msg.edit_text("Качаю видео...")
+    status_msg = await update.message.reply_text("Качаю видео...")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        filepath = os.path.join(tmp_dir, "video.mp4")
+        out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
+        ydl_opts = {
+            "outtmpl": out_template,
+            "format": "mp4/best",
+            "quiet": True,
+            "no_warnings": True,
+        }
 
         try:
-            with requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, stream=True, timeout=60) as r:
-                r.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        f.write(chunk)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(text, download=True)
+                filepath = ydl.prepare_filename(info)
         except Exception as e:
-            logger.exception("Ошибка скачивания файла")
+            logger.exception("Ошибка скачивания")
             await status_msg.edit_text(f"Не получилось скачать видео 😔\n{e}")
             return
 
         try:
-            # Telegram бот-API ограничивает файлы 50 МБ на отправку через send_video
             file_size = os.path.getsize(filepath)
             if file_size > 49 * 1024 * 1024:
                 await status_msg.edit_text(
