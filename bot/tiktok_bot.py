@@ -1,182 +1,123 @@
+import logging
 import os
 import re
-import json
-import logging
 import tempfile
+
 import requests
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+
+from snaptik_scraper_v2 import SnapTikClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER")
+BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
+MAX_TELEGRAM_BYTES = 49 * 1024 * 1024
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0 Safari/537.36"
-    ),
-    "Referer": "https://www.tiktok.com/",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+TIKTOK_RE = re.compile(r"https?://(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/\S+", re.I)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Кинь мне ссылку на TikTok видео — скачаю и пришлю сюда."
+        "Привет! Кинь ссылку на TikTok — попробую скачать через SnapTik в максимальном доступном качестве."
     )
 
 
-def is_tiktok_link(text: str) -> bool:
-    text = text.lower()
-    return "tiktok.com" in text or "vm.tiktok" in text
+def extract_tiktok_link(text: str) -> str | None:
+    match = TIKTOK_RE.search(text or "")
+    return match.group(0).rstrip(").,]}>\"'") if match else None
 
 
-def resolve_full_url(session: requests.Session, tiktok_url: str) -> str:
-    resp = session.get(
-        tiktok_url, headers=HEADERS, allow_redirects=True, timeout=20
-    )
-    return resp.url
+def download_candidate(client: SnapTikClient, url: str, filepath: str) -> int:
+    headers = {
+        "Accept": "video/mp4,application/octet-stream,*/*;q=0.8",
+        "Range": "bytes=0-",
+    }
 
+    with client.session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=90) as response:
+        response.raise_for_status()
 
-def extract_video_json(html: str) -> dict:
-    """
-    Достаёт JSON с данными видео из HTML-страницы TikTok.
-    Пробуем оба варианта названия script-тега, т.к. TikTok их менял.
-    """
-    patterns = [
-        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
-        r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, html, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                continue
-    raise RuntimeError("Не нашёл JSON с данными видео на странице TikTok")
+        content_type = response.headers.get("content-type", "").lower()
+        if "text/html" in content_type and "video" not in content_type:
+            raise RuntimeError(f"вместо видео сервер вернул HTML ({content_type})")
 
+        total = 0
+        with open(filepath, "wb") as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_TELEGRAM_BYTES:
+                    raise RuntimeError("файл больше лимита Telegram-бота (~50 МБ)")
+                f.write(chunk)
 
-def find_video_node(data: dict) -> dict:
-    """
-    Ищет узел с полем 'bitrateInfo' в любом месте JSON-дерева —
-    структура немного отличается между __UNIVERSAL_DATA__ и SIGI_STATE.
-    """
-    stack = [data]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            if "bitrateInfo" in node or ("playAddr" in node and "downloadAddr" in node):
-                return node
-            stack.extend(node.values())
-        elif isinstance(node, list):
-            stack.extend(node)
-    raise RuntimeError("Не нашёл информацию о видео (bitrateInfo/playAddr) в JSON")
-
-
-def get_hd_video_url(session: requests.Session, tiktok_url: str) -> str:
-    full_url = resolve_full_url(session, tiktok_url)
-    logger.info("Полный URL: %s", full_url)
-
-    resp = session.get(full_url, headers=HEADERS, timeout=20)
-    resp.raise_for_status()
-
-    data = extract_video_json(resp.text)
-    video = find_video_node(data)
-
-    bitrate_info = video.get("bitrateInfo") or []
-    candidates = []
-    for b in bitrate_info:
-        play_addr = b.get("PlayAddr") or {}
-        url_list = play_addr.get("UrlList") or []
-        size = play_addr.get("DataSize") or 0
-        if url_list:
-            candidates.append((int(size), url_list[0]))
-
-    # запасной вариант, если bitrateInfo пуст
-    if not candidates:
-        for key in ("downloadAddr", "playAddr"):
-            if video.get(key):
-                candidates.append((0, video[key]))
-
-    if not candidates:
-        raise RuntimeError("Не нашёл ни одной ссылки на видео")
-
-    best_size, video_url = max(candidates, key=lambda c: c[0])
-    logger.info(
-        "Выбран вариант %.2f MiB из %d доступных: %s",
-        best_size / 1024 / 1024, len(candidates), video_url,
-    )
-    return video_url.replace("&amp;", "&")
+    if total < 1024:
+        raise RuntimeError(f"слишком маленький файл: {total} байт")
+    return total
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    if not is_tiktok_link(text):
+    tiktok_url = extract_tiktok_link(update.message.text or "")
+    if not tiktok_url:
         await update.message.reply_text("Это не похоже на ссылку TikTok 🤔")
         return
 
-    status_msg = await update.message.reply_text("Ищу лучшую версию видео...")
-
-    session = requests.Session()
+    status = await update.message.reply_text("Запрашиваю варианты качества у SnapTik…")
+    client = SnapTikClient()
 
     try:
-        video_url = get_hd_video_url(session, text)
+        links = client.resolve(tiktok_url)
     except Exception as e:
-        logger.exception("Ошибка получения ссылки")
-        await status_msg.edit_text(f"Не получилось получить ссылку 😔\n{e}")
+        logger.exception("SnapTik resolve failed")
+        await status.edit_text(f"SnapTik не отдал ссылку 😔\n{e}")
         return
 
-    await status_msg.edit_text("Качаю видео...")
-
     with tempfile.TemporaryDirectory() as tmp_dir:
-        filepath = os.path.join(tmp_dir, "video.mp4")
+        filepath = os.path.join(tmp_dir, "tiktok.mp4")
+        last_error = None
 
-        download_headers = dict(HEADERS)
-        download_headers["Range"] = "bytes=0-"
-
-        try:
-            with session.get(
-                video_url, headers=download_headers, stream=True, timeout=60
-            ) as r:
-                r.raise_for_status()
-                with open(filepath, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        f.write(chunk)
-        except Exception as e:
-            logger.exception("Ошибка скачивания файла")
-            await status_msg.edit_text(f"Не получилось скачать видео 😔\n{e}")
-            return
-
-        try:
-            file_size = os.path.getsize(filepath)
-            logger.info("Скачанный файл: %.2f MiB", file_size / 1024 / 1024)
-
-            if file_size > 49 * 1024 * 1024:
-                await status_msg.edit_text(
-                    "Видео слишком большое для отправки через бота (>50МБ)."
+        # resolve() already sorts links by the strongest quality hints first.
+        for index, candidate in enumerate(links[:8], start=1):
+            try:
+                await status.edit_text(
+                    f"Пробую вариант {index}/{min(len(links), 8)}: {candidate.label[:70] or 'video'}"
                 )
-                return
+                size = download_candidate(client, candidate.url, filepath)
+                logger.info(
+                    "Downloaded candidate %d: %.2f MiB, label=%s",
+                    index,
+                    size / 1024 / 1024,
+                    candidate.label,
+                )
 
-            with open(filepath, "rb") as video_file:
-                await update.message.reply_document(document=video_file)
-            await status_msg.delete()
-        except Exception as e:
-            logger.exception("Ошибка отправки")
-            await status_msg.edit_text(f"Скачал, но не смог отправить: {e}")
+                with open(filepath, "rb") as video_file:
+                    await update.message.reply_document(
+                        document=video_file,
+                        filename="tiktok.mp4",
+                        caption=f"SnapTik: {size / 1024 / 1024:.2f} MiB",
+                    )
+                await status.delete()
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning("Candidate %d failed: %s", index, e, exc_info=True)
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                except OSError:
+                    pass
+
+        await status.edit_text(
+            "SnapTik нашёл варианты, но ни один не удалось скачать 😔\n"
+            f"Последняя ошибка: {last_error}"
+        )
 
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задана переменная окружения TG_BOT_TOKEN")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
