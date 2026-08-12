@@ -54,17 +54,23 @@ def get_hd_video_url(tiktok_url: str) -> str:
         raise RuntimeError(f"tikwm вернул ошибку: {payload.get('msg')}")
 
     data = payload.get("data", {})
-    video_url = data.get("hdplay") or data.get("play")
-    if not video_url:
+
+    candidates = [
+        (data.get("hd_size") or 0, data.get("hdplay")),
+        (data.get("size") or 0, data.get("play")),
+    ]
+    candidates = [(size, url) for size, url in candidates if url]
+    if not candidates:
         raise RuntimeError("Не нашёл ссылку на видео в ответе tikwm")
 
-    # ссылки от tikwm иногда относительные — достраиваем при необходимости
+    best_size, video_url = max(candidates, key=lambda c: c[0])
+
     if video_url.startswith("/"):
         video_url = "https://www.tikwm.com" + video_url
 
     logger.info(
-        "tikwm: hd_size=%s size=%s url=%s",
-        data.get("hd_size"), data.get("size"), video_url,
+        "tikwm: выбран вариант размером %.2f MiB (hd_size=%s size=%s) url=%s",
+        best_size / 1024 / 1024, data.get("hd_size"), data.get("size"), video_url,
     )
     return video_url
 
