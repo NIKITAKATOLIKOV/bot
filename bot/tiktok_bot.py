@@ -40,12 +40,8 @@ def is_tiktok_link(text: str) -> bool:
     return "tiktok.com" in text or "vm.tiktok" in text
 
 
-def resolve_full_url(tiktok_url: str) -> str:
-    """
-    Короткие ссылки (vt.tiktok.com/..., vm.tiktok.com/...) редиректят
-    на полный URL вида tiktok.com/@user/video/ID — он нам и нужен.
-    """
-    resp = requests.get(
+def resolve_full_url(session: requests.Session, tiktok_url: str) -> str:
+    resp = session.get(
         tiktok_url, headers=HEADERS, allow_redirects=True, timeout=20
     )
     return resp.url
@@ -87,11 +83,11 @@ def find_video_node(data: dict) -> dict:
     raise RuntimeError("Не нашёл информацию о видео (bitrateInfo/playAddr) в JSON")
 
 
-def get_hd_video_url(tiktok_url: str) -> str:
-    full_url = resolve_full_url(tiktok_url)
+def get_hd_video_url(session: requests.Session, tiktok_url: str) -> str:
+    full_url = resolve_full_url(session, tiktok_url)
     logger.info("Полный URL: %s", full_url)
 
-    resp = requests.get(full_url, headers=HEADERS, timeout=20)
+    resp = session.get(full_url, headers=HEADERS, timeout=20)
     resp.raise_for_status()
 
     data = extract_video_json(resp.text)
@@ -132,8 +128,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("Ищу лучшую версию видео...")
 
+    session = requests.Session()
+
     try:
-        video_url = get_hd_video_url(text)
+        video_url = get_hd_video_url(session, text)
     except Exception as e:
         logger.exception("Ошибка получения ссылки")
         await status_msg.edit_text(f"Не получилось получить ссылку 😔\n{e}")
@@ -144,8 +142,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with tempfile.TemporaryDirectory() as tmp_dir:
         filepath = os.path.join(tmp_dir, "video.mp4")
 
+        download_headers = dict(HEADERS)
+        download_headers["Range"] = "bytes=0-"
+
         try:
-            with requests.get(video_url, headers=HEADERS, stream=True, timeout=60) as r:
+            with session.get(
+                video_url, headers=download_headers, stream=True, timeout=60
+            ) as r:
                 r.raise_for_status()
                 with open(filepath, "wb") as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
