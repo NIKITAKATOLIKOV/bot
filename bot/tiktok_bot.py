@@ -41,7 +41,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
         ydl_opts = {
             "outtmpl": out_template,
-            "format": "mp4/best",
+            "format": "best",
+            "format_sort": ["res", "fps", "vcodec:h264", "quality"],
             "quiet": True,
             "no_warnings": True,
         }
@@ -64,7 +65,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             with open(filepath, "rb") as video_file:
-                await update.message.reply_video(video=video_file)
+                await update.message.reply_document(document=video_file)
             await status_msg.delete()
         except Exception as e:
             logger.exception("Ошибка отправки")
