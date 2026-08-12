@@ -1,7 +1,7 @@
 import os
 import logging
 import tempfile
-import yt_dlp
+import requests
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,6 +16,15 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER")
 
+TIKWM_API = "https://www.tikwm.com/api/"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0 Safari/537.36"
+    )
+}
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -28,6 +37,38 @@ def is_tiktok_link(text: str) -> bool:
     return "tiktok.com" in text or "vm.tiktok" in text
 
 
+def get_hd_video_url(tiktok_url: str) -> str:
+    """
+    Запрашивает у tikwm.com прямую HD-ссылку без вотемарки.
+    """
+    resp = requests.get(
+        TIKWM_API,
+        params={"url": tiktok_url, "hd": "1"},
+        headers=HEADERS,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if payload.get("code") != 0:
+        raise RuntimeError(f"tikwm вернул ошибку: {payload.get('msg')}")
+
+    data = payload.get("data", {})
+    video_url = data.get("hdplay") or data.get("play")
+    if not video_url:
+        raise RuntimeError("Не нашёл ссылку на видео в ответе tikwm")
+
+    # ссылки от tikwm иногда относительные — достраиваем при необходимости
+    if video_url.startswith("/"):
+        video_url = "https://www.tikwm.com" + video_url
+
+    logger.info(
+        "tikwm: hd_size=%s size=%s url=%s",
+        data.get("hd_size"), data.get("size"), video_url,
+    )
+    return video_url
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
@@ -35,52 +76,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Это не похоже на ссылку TikTok 🤔")
         return
 
-    status_msg = await update.message.reply_text("Качаю видео...")
+    status_msg = await update.message.reply_text("Ищу HD-ссылку...")
+
+    try:
+        video_url = get_hd_video_url(text)
+    except Exception as e:
+        logger.exception("Ошибка получения ссылки от tikwm")
+        await status_msg.edit_text(f"Не получилось получить ссылку 😔\n{e}")
+        return
+
+    await status_msg.edit_text("Качаю видео...")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
-        out_template = os.path.join(tmp_dir, "%(id)s.%(ext)s")
-        ydl_opts = {
-            "outtmpl": out_template,
-            "format": "download/best",
-            "format_sort": ["res", "tbr", "quality"],
-            "quiet": True,
-            "no_warnings": True,
-        }
+        filepath = os.path.join(tmp_dir, "video.mp4")
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(text, download=False)
-                formats = info.get("formats", [])
-                logger.info("Доступные форматы для %s:", text)
-                for f in formats:
-                    from urllib.parse import urlparse
-                    url_host = urlparse(f.get("url", "")).netloc
-                    logger.info(
-                        "  id=%s  res=%sx%s  tbr=%s  vcodec=%s  filesize=%s  filesize_approx=%s  host=%s",
-                        f.get("format_id"),
-                        f.get("width"),
-                        f.get("height"),
-                        f.get("tbr"),
-                        f.get("vcodec"),
-                        f.get("filesize"),
-                        f.get("filesize_approx"),
-                        url_host,
-                    )
-                selected = info.get("requested_formats") or [info]
-                for sf in (selected if isinstance(selected, list) else [selected]):
-                    logger.info(
-                        "ВЫБРАН формат: id=%s res=%sx%s",
-                        sf.get("format_id"), sf.get("width"), sf.get("height"),
-                    )
-                info = ydl.extract_info(text, download=True)
-                filepath = ydl.prepare_filename(info)
+            with requests.get(video_url, headers=HEADERS, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(filepath, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
         except Exception as e:
-            logger.exception("Ошибка скачивания")
+            logger.exception("Ошибка скачивания файла")
             await status_msg.edit_text(f"Не получилось скачать видео 😔\n{e}")
             return
 
         try:
             file_size = os.path.getsize(filepath)
+            logger.info("Скачанный файл: %.2f MiB", file_size / 1024 / 1024)
+
             if file_size > 49 * 1024 * 1024:
                 await status_msg.edit_text(
                     "Видео слишком большое для отправки через бота (>50МБ)."
