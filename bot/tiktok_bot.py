@@ -3,7 +3,6 @@ import os
 import re
 import tempfile
 
-import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -33,9 +32,16 @@ def download_candidate(client: SnapTikClient, url: str, filepath: str) -> int:
     headers = {
         "Accept": "video/mp4,application/octet-stream,*/*;q=0.8",
         "Range": "bytes=0-",
+        "Referer": "https://snaptik.net/en",
     }
 
-    with client.session.get(url, headers=headers, stream=True, allow_redirects=True, timeout=90) as response:
+    with client.session.get(
+        url,
+        headers=headers,
+        stream=True,
+        allow_redirects=True,
+        timeout=90,
+    ) as response:
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "").lower()
@@ -77,11 +83,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filepath = os.path.join(tmp_dir, "tiktok.mp4")
         last_error = None
 
-        # resolve() already sorts links by the strongest quality hints first.
         for index, candidate in enumerate(links[:8], start=1):
             try:
                 await status.edit_text(
-                    f"Пробую вариант {index}/{min(len(links), 8)}: {candidate.label[:70] or 'video'}"
+                    f"Пробую вариант {index}/{min(len(links), 8)}: "
+                    f"{candidate.label[:70] or 'video'}"
                 )
                 size = download_candidate(client, candidate.url, filepath)
                 logger.info(
