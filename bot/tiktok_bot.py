@@ -1,4 +1,6 @@
 import os
+import re
+import json
 import logging
 import tempfile
 import requests
@@ -16,13 +18,14 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "ВСТАВЬ_СЮДА_ТОКЕН_ОТ_BOTFATHER")
 
-TIKWM_API = "https://www.tikwm.com/api/"
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0 Safari/537.36"
-    )
+    ),
+    "Referer": "https://www.tiktok.com/",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 
@@ -37,42 +40,87 @@ def is_tiktok_link(text: str) -> bool:
     return "tiktok.com" in text or "vm.tiktok" in text
 
 
-def get_hd_video_url(tiktok_url: str) -> str:
+def resolve_full_url(tiktok_url: str) -> str:
     """
-    Запрашивает у tikwm.com прямую HD-ссылку без вотемарки.
+    Короткие ссылки (vt.tiktok.com/..., vm.tiktok.com/...) редиректят
+    на полный URL вида tiktok.com/@user/video/ID — он нам и нужен.
     """
     resp = requests.get(
-        TIKWM_API,
-        params={"url": tiktok_url, "hd": "1"},
-        headers=HEADERS,
-        timeout=30,
+        tiktok_url, headers=HEADERS, allow_redirects=True, timeout=20
     )
-    resp.raise_for_status()
-    payload = resp.json()
+    return resp.url
 
-    if payload.get("code") != 0:
-        raise RuntimeError(f"tikwm вернул ошибку: {payload.get('msg')}")
 
-    data = payload.get("data", {})
-
-    candidates = [
-        (data.get("hd_size") or 0, data.get("hdplay")),
-        (data.get("size") or 0, data.get("play")),
+def extract_video_json(html: str) -> dict:
+    """
+    Достаёт JSON с данными видео из HTML-страницы TikTok.
+    Пробуем оба варианта названия script-тега, т.к. TikTok их менял.
+    """
+    patterns = [
+        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        r'<script id="SIGI_STATE"[^>]*>(.*?)</script>',
     ]
-    candidates = [(size, url) for size, url in candidates if url]
+    for pattern in patterns:
+        match = re.search(pattern, html, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                continue
+    raise RuntimeError("Не нашёл JSON с данными видео на странице TikTok")
+
+
+def find_video_node(data: dict) -> dict:
+    """
+    Ищет узел с полем 'bitrateInfo' в любом месте JSON-дерева —
+    структура немного отличается между __UNIVERSAL_DATA__ и SIGI_STATE.
+    """
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "bitrateInfo" in node or ("playAddr" in node and "downloadAddr" in node):
+                return node
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    raise RuntimeError("Не нашёл информацию о видео (bitrateInfo/playAddr) в JSON")
+
+
+def get_hd_video_url(tiktok_url: str) -> str:
+    full_url = resolve_full_url(tiktok_url)
+    logger.info("Полный URL: %s", full_url)
+
+    resp = requests.get(full_url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+
+    data = extract_video_json(resp.text)
+    video = find_video_node(data)
+
+    bitrate_info = video.get("bitrateInfo") or []
+    candidates = []
+    for b in bitrate_info:
+        play_addr = b.get("PlayAddr") or {}
+        url_list = play_addr.get("UrlList") or []
+        size = play_addr.get("DataSize") or 0
+        if url_list:
+            candidates.append((int(size), url_list[0]))
+
+    # запасной вариант, если bitrateInfo пуст
     if not candidates:
-        raise RuntimeError("Не нашёл ссылку на видео в ответе tikwm")
+        for key in ("downloadAddr", "playAddr"):
+            if video.get(key):
+                candidates.append((0, video[key]))
+
+    if not candidates:
+        raise RuntimeError("Не нашёл ни одной ссылки на видео")
 
     best_size, video_url = max(candidates, key=lambda c: c[0])
-
-    if video_url.startswith("/"):
-        video_url = "https://www.tikwm.com" + video_url
-
     logger.info(
-        "tikwm: выбран вариант размером %.2f MiB (hd_size=%s size=%s) url=%s",
-        best_size / 1024 / 1024, data.get("hd_size"), data.get("size"), video_url,
+        "Выбран вариант %.2f MiB из %d доступных: %s",
+        best_size / 1024 / 1024, len(candidates), video_url,
     )
-    return video_url
+    return video_url.replace("&amp;", "&")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -82,12 +130,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Это не похоже на ссылку TikTok 🤔")
         return
 
-    status_msg = await update.message.reply_text("Ищу HD-ссылку...")
+    status_msg = await update.message.reply_text("Ищу лучшую версию видео...")
 
     try:
         video_url = get_hd_video_url(text)
     except Exception as e:
-        logger.exception("Ошибка получения ссылки от tikwm")
+        logger.exception("Ошибка получения ссылки")
         await status_msg.edit_text(f"Не получилось получить ссылку 😔\n{e}")
         return
 
