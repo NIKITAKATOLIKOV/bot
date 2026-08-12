@@ -1,88 +1,50 @@
 """
-Скрапер snaptik.net.
+Скрапер snaptik.net — версия по реальному запросу (подсмотрено через DevTools).
 
-ВАЖНО: этот код основан на типичной схеме работы клонов snaptik и может
-перестать работать в любой момент, если они поменяют фронтенд/токены.
-Проверь и при необходимости подправь селекторы/эндпоинты через DevTools
-(вкладка Network -> Fetch/XHR) на реальном сайте, если что-то сломается.
+Реальный эндпоинт: POST https://snaptik.net/api/ajaxSearch
+Тело: q=<ссылка на tiktok>&lang=en
+Ответ: JSON с полем "data", в котором лежит HTML с кнопками скачивания,
+одна из которых ведёт на https://dl.snapcdn.app/get?token=<JWT> — это уже
+прямая ссылка на видео.
 
-Схема:
-1. GET https://snaptik.net/en  -> достаём скрытый token из формы.
-2. POST https://snaptik.net/abc2.php с url и token -> получаем ответ,
-   который обычно завёрнут в eval-packed JS (Dean Edwards packer).
-3. Распаковываем packer -> получаем HTML с ссылками на скачивание.
-4. Парсим ссылки из HTML через BeautifulSoup.
+ВАЖНО: сайт защищён Cloudflare (виден cf_clearance в куках браузера).
+Обычный requests, скорее всего, получит 403 без прохождения JS-проверки
+Cloudflare. Поэтому используем cloudscraper — библиотеку, которая умеет
+автоматически обходить эту защиту (эмулирует то, что делает браузер).
+
+Установка: pip install cloudscraper beautifulsoup4
 """
 
 import re
-import requests
+import json
+import cloudscraper
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://snaptik.net"
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "origin": BASE_URL,
+    "referer": f"{BASE_URL}/en",
+    "x-requested-with": "XMLHttpRequest",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0 Safari/537.36"
+        "Chrome/151.0.0.0 Safari/537.36"
     ),
-    "Referer": f"{BASE_URL}/en",
 }
 
 
-def unpack_js(packed: str) -> str:
+def get_scraper():
     """
-    Минимальный распаковщик для Dean Edwards JS Packer
-    (eval(function(p,a,c,k,e,d){...}('...',36,N,'a|b|c'.split('|'),0,{})))
-    Многие "downloader" сайты используют именно этот паковщик.
+    Создаёт cloudscraper-сессию, которая сама пройдёт Cloudflare-проверку
+    при первом обращении к сайту.
     """
-    match = re.search(
-        r"eval\(function\(p,a,c,k,e,d\).*?\)\((.*)\)\s*$",
-        packed,
-        re.DOTALL,
+    return cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "darwin", "mobile": False}
     )
-    if not match:
-        # возможно ответ уже не запакован — вернём как есть
-        return packed
-
-    args = match.group(1)
-    # args выглядит примерно как: 'p_string',36,c,'k|k|k'.split('|'),0,{}
-    parts = re.match(
-        r"'(?P<p>(?:[^'\\]|\\.)*)',\s*\d+,\s*(?P<c>\d+),\s*'(?P<k>(?:[^'\\]|\\.)*)'\.split\('\|'\)",
-        args,
-        re.DOTALL,
-    )
-    if not parts:
-        raise ValueError("Не удалось распарсить packer — формат ответа изменился")
-
-    p = parts.group("p").encode().decode("unicode_escape")
-    c = int(parts.group("c"))
-    k = parts.group("k").split("|")
-
-    def base36(n: int) -> str:
-        digits = "0123456789abcdefghijklmnopqrstuvwxyz"
-        if n == 0:
-            return "0"
-        out = ""
-        while n:
-            n, r = divmod(n, 36)
-            out = digits[r] + out
-        return out
-
-    for i in range(c - 1, -1, -1):
-        if i < len(k) and k[i]:
-            p = re.sub(r"\b" + base36(i) + r"\b", k[i], p)
-
-    return p
-
-
-def get_token(session: requests.Session) -> str:
-    resp = session.get(f"{BASE_URL}/en", headers=HEADERS, timeout=15)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    token_input = soup.find("input", {"name": "token"})
-    if not token_input or not token_input.get("value"):
-        raise RuntimeError("Не нашёл token на странице — верстка сайта изменилась")
-    return token_input["value"]
 
 
 def fetch_download_links(tiktok_url: str) -> list[dict]:
@@ -90,37 +52,47 @@ def fetch_download_links(tiktok_url: str) -> list[dict]:
     Возвращает список найденных ссылок на скачивание:
     [{"quality": "...", "url": "..."}]
     """
-    session = requests.Session()
-    token = get_token(session)
+    scraper = get_scraper()
 
-    resp = session.post(
-        f"{BASE_URL}/abc2.php",
+    # заходим на главную, чтобы получить куки (в т.ч. пройти Cloudflare)
+    scraper.get(f"{BASE_URL}/en", headers=HEADERS, timeout=30)
+
+    resp = scraper.post(
+        f"{BASE_URL}/api/ajaxSearch",
         headers=HEADERS,
-        data={"url": tiktok_url, "lang": "en", "token": token},
-        timeout=20,
+        data={"q": tiktok_url, "lang": "en"},
+        timeout=30,
     )
     resp.raise_for_status()
 
-    html = resp.text
-    if "eval(function(p,a,c,k,e,d)" in html:
-        html = unpack_js(html)
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"Ответ не в JSON (возможно, заблокировал Cloudflare): {resp.text[:300]}"
+        )
+
+    html = payload.get("data")
+    if not html:
+        raise RuntimeError(f"В ответе нет поля 'data': {payload}")
 
     soup = BeautifulSoup(html, "html.parser")
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if href.startswith("http") and ("download" in a.get("class", []) or ".mp4" in href):
-            links.append({"quality": a.get_text(strip=True) or "video", "url": href})
+        text = a.get_text(strip=True)
+        if "dl.snapcdn.app" in href or "download" in " ".join(a.get("class", [])):
+            links.append({"quality": text or "video", "url": href})
 
     if not links:
         raise RuntimeError(
-            "Ссылок на видео не нашлось — либо сайт поменял разметку, "
-            "либо сработала защита (капча/rate-limit)."
+            "Ссылок на видео не нашлось в ответе — либо изменился формат "
+            "ответа, либо видео недоступно."
         )
     return links
 
 
 if __name__ == "__main__":
-    test_url = "https://www.tiktok.com/@example/video/1234567890"
+    test_url = "https://www.tiktok.com/@theeditsf_/video/7673107848942849302"
     for link in fetch_download_links(test_url):
         print(link["quality"], "->", link["url"])
