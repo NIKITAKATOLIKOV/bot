@@ -49,6 +49,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(text, download=False)
+                formats = info.get("formats", [])
+                logger.info("Доступные форматы для %s:", text)
+                for f in formats:
+                    logger.info(
+                        "  id=%s  res=%sx%s  tbr=%s  vcodec=%s  ext=%s",
+                        f.get("format_id"),
+                        f.get("width"),
+                        f.get("height"),
+                        f.get("tbr"),
+                        f.get("vcodec"),
+                        f.get("ext"),
+                    )
                 info = ydl.extract_info(text, download=True)
                 filepath = ydl.prepare_filename(info)
         except Exception as e:
