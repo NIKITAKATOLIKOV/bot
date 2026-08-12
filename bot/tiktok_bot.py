@@ -7,7 +7,7 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
-from snaptik_scraper_v2 import SnapTikClient
+from snaptik_scraper import SnapTikClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
