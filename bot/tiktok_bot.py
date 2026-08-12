@@ -53,14 +53,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 formats = info.get("formats", [])
                 logger.info("Доступные форматы для %s:", text)
                 for f in formats:
+                    from urllib.parse import urlparse
+                    url_host = urlparse(f.get("url", "")).netloc
                     logger.info(
-                        "  id=%s  res=%sx%s  tbr=%s  vcodec=%s  ext=%s",
+                        "  id=%s  res=%sx%s  tbr=%s  vcodec=%s  filesize=%s  filesize_approx=%s  host=%s",
                         f.get("format_id"),
                         f.get("width"),
                         f.get("height"),
                         f.get("tbr"),
                         f.get("vcodec"),
-                        f.get("ext"),
+                        f.get("filesize"),
+                        f.get("filesize_approx"),
+                        url_host,
+                    )
+                selected = info.get("requested_formats") or [info]
+                for sf in (selected if isinstance(selected, list) else [selected]):
+                    logger.info(
+                        "ВЫБРАН формат: id=%s res=%sx%s",
+                        sf.get("format_id"), sf.get("width"), sf.get("height"),
                     )
                 info = ydl.extract_info(text, download=True)
                 filepath = ydl.prepare_filename(info)
