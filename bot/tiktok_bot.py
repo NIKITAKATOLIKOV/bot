@@ -3,7 +3,7 @@ import os
 import re
 import tempfile
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -19,6 +19,48 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 
+REQUIRED_CHANNEL = "@thefencemusic"
+REQUIRED_CHANNEL_URL = "https://t.me/thefencemusic"
+
+
+async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if update.effective_user is None:
+        return False
+
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=REQUIRED_CHANNEL,
+            user_id=update.effective_user.id,
+        )
+        return member.status in {"member", "administrator", "creator"}
+    except Exception:
+        logger.exception(
+            "Не удалось проверить подписку пользователя %s на %s",
+            update.effective_user.id,
+            REQUIRED_CHANNEL,
+        )
+        return False
+
+
+async def require_subscription(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    if await is_subscribed(update, context):
+        return True
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Подписаться на канал", url=REQUIRED_CHANNEL_URL)]]
+    )
+    await update.message.reply_text(
+        "Чтобы пользоваться ботом, подпишись на @thefencemusic, "
+        "а потом отправь ссылку ещё раз.",
+        reply_markup=keyboard,
+    )
+    return False
+
+
+
 # URL второго Railway-сервиса с Local Telegram Bot API.
 # Пример: https://telegram-api-production-xxxx.up.railway.app
 BOT_API_SERVER_URL = os.environ.get("TELEGRAM_BOT_API_URL", "").strip().rstrip("/")
@@ -33,10 +75,19 @@ TIKTOK_RE = re.compile(
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_subscription(update, context):
+        return
+
     mode = "до ~1.95 ГБ" if BOT_API_SERVER_URL else "до ~50 МБ (обычный Telegram API)"
     await update.message.reply_text(
         "Привет! Кинь ссылку на TikTok — скачаю через SnapTik "
         f"в максимальном доступном качестве.\nРежим отправки: {mode}."
+    )
+
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Твой Telegram ID: {update.effective_user.id}"
     )
 
 
@@ -96,6 +147,9 @@ def download_candidate(client: SnapTikClient, url: str, filepath: str) -> int:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_subscription(update, context):
+        return
+
     tiktok_url = extract_tiktok_link(update.message.text or "")
     if not tiktok_url:
         await update.message.reply_text("Это не похоже на ссылку TikTok 🤔")
@@ -211,6 +265,7 @@ def build_app():
 def main():
     app = build_app()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", show_id))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
