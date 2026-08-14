@@ -86,7 +86,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     mode = "до ~1.95 ГБ" if BOT_API_SERVER_URL else "до ~50 МБ (обычный Telegram API)"
     await update.message.reply_text(
-        "Привет! Кинь ссылку на TikTok — скачаю через SnapTik "
+        "Привет! Кинь ссылку на TikTok — скачаю его в HD и пришлю тебе "
         f"в максимальном доступном качестве.\nРежим отправки: {mode}."
     )
 
@@ -161,14 +161,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Это не похоже на ссылку TikTok 🤔")
         return
 
-    status = await update.message.reply_text("Запрашиваю варианты качества у SnapTik…")
+    status = await update.message.reply_text("Запрашиваю варианты качества у найнмайса…")
     client = SnapTikClient()
 
     try:
         links = client.resolve(tiktok_url)
     except Exception as e:
-        logger.exception("SnapTik resolve failed")
-        await status.edit_text(f"SnapTik не отдал ссылку 😔\n{e}")
+        logger.exception("Найнмайс resolve failed")
+        await status.edit_text(f"Найнмайс не отдал ссылку 😔\n{e}")
         return
 
     with tempfile.TemporaryDirectory() as tmp_dir:
