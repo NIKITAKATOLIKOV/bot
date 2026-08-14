@@ -4,7 +4,13 @@ import re
 import tempfile
 
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from snaptik_scraper import SnapTikClient
 
@@ -12,14 +18,25 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-MAX_TELEGRAM_BYTES = 49 * 1024 * 1024
 
-TIKTOK_RE = re.compile(r"https?://(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/\S+", re.I)
+# URL второго Railway-сервиса с Local Telegram Bot API.
+# Пример: https://telegram-api-production-xxxx.up.railway.app
+BOT_API_SERVER_URL = os.environ.get("TELEGRAM_BOT_API_URL", "").strip().rstrip("/")
+
+# Local Bot API поддерживает загрузку до 2000 MB. Оставляем небольшой запас.
+MAX_TELEGRAM_BYTES = 1950 * 1024 * 1024
+
+TIKTOK_RE = re.compile(
+    r"https?://(?:www\.|m\.|vm\.|vt\.)?tiktok\.com/\S+",
+    re.I,
+)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode = "до ~1.95 ГБ" if BOT_API_SERVER_URL else "до ~50 МБ (обычный Telegram API)"
     await update.message.reply_text(
-        "Привет! Кинь ссылку на TikTok — попробую скачать через SnapTik в максимальном доступном качестве."
+        "Привет! Кинь ссылку на TikTok — скачаю через SnapTik "
+        f"в максимальном доступном качестве.\nРежим отправки: {mode}."
     )
 
 
@@ -40,7 +57,7 @@ def download_candidate(client: SnapTikClient, url: str, filepath: str) -> int:
         headers=headers,
         stream=True,
         allow_redirects=True,
-        timeout=90,
+        timeout=(20, 180),
     ) as response:
         response.raise_for_status()
 
@@ -48,18 +65,33 @@ def download_candidate(client: SnapTikClient, url: str, filepath: str) -> int:
         if "text/html" in content_type and "video" not in content_type:
             raise RuntimeError(f"вместо видео сервер вернул HTML ({content_type})")
 
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                announced_size = int(content_length)
+                if announced_size > MAX_TELEGRAM_BYTES:
+                    raise RuntimeError(
+                        f"файл слишком большой: {announced_size / 1024 / 1024:.1f} MiB "
+                        "(лимит этой конфигурации ~1950 MiB)"
+                    )
+            except ValueError:
+                pass
+
         total = 0
         with open(filepath, "wb") as f:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
+            for chunk in response.iter_content(chunk_size=4 * 1024 * 1024):
                 if not chunk:
                     continue
                 total += len(chunk)
                 if total > MAX_TELEGRAM_BYTES:
-                    raise RuntimeError("файл больше лимита Telegram-бота (~50 МБ)")
+                    raise RuntimeError(
+                        "файл превысил лимит этой конфигурации (~1950 MiB)"
+                    )
                 f.write(chunk)
 
     if total < 1024:
         raise RuntimeError(f"слишком маленький файл: {total} байт")
+
     return total
 
 
@@ -89,25 +121,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Пробую вариант {index}/{min(len(links), 8)}: "
                     f"{candidate.label[:70] or 'video'}"
                 )
+
                 size = download_candidate(client, candidate.url, filepath)
+                size_mib = size / 1024 / 1024
+
                 logger.info(
                     "Downloaded candidate %d: %.2f MiB, label=%s",
                     index,
-                    size / 1024 / 1024,
+                    size_mib,
                     candidate.label,
+                )
+
+                # Без Local Bot API оставляем понятную ошибку вместо долгой
+                # попытки отправить огромный файл через api.telegram.org.
+                if not BOT_API_SERVER_URL and size > 49 * 1024 * 1024:
+                    await status.edit_text(
+                        f"Видео скачано: {size_mib:.1f} MiB, но большой Telegram API "
+                        "ещё не подключён. Добавь TELEGRAM_BOT_API_URL."
+                    )
+                    return
+
+                await status.edit_text(
+                    f"Видео скачано: {size_mib:.1f} MiB. Отправляю в Telegram…"
                 )
 
                 with open(filepath, "rb") as video_file:
                     await update.message.reply_document(
                         document=video_file,
                         filename="tiktok.mp4",
-                        caption=f"SnapTik: {size / 1024 / 1024:.2f} MiB",
+                        caption=f"SnapTik: {size_mib:.2f} MiB",
+                        read_timeout=3600,
+                        write_timeout=3600,
+                        connect_timeout=60,
+                        pool_timeout=60,
                     )
+
                 await status.delete()
                 return
+
             except Exception as e:
                 last_error = e
-                logger.warning("Candidate %d failed: %s", index, e, exc_info=True)
+                logger.warning(
+                    "Candidate %d failed: %s",
+                    index,
+                    e,
+                    exc_info=True,
+                )
                 try:
                     if os.path.exists(filepath):
                         os.remove(filepath)
@@ -115,16 +174,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
         await status.edit_text(
-            "SnapTik нашёл варианты, но ни один не удалось скачать 😔\n"
+            "SnapTik нашёл варианты, но ни один не удалось скачать/отправить 😔\n"
             f"Последняя ошибка: {last_error}"
         )
 
 
-def main():
+def build_app():
     if not BOT_TOKEN:
         raise RuntimeError("Не задана переменная окружения TG_BOT_TOKEN")
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    builder = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .media_write_timeout(3600)
+    )
+
+    if BOT_API_SERVER_URL:
+        # В Railway бот и Bot API работают в разных контейнерах.
+        # Поэтому local_mode=False: файл передаётся по HTTP, а не как file:// путь.
+        builder = (
+            builder
+            .base_url(f"{BOT_API_SERVER_URL}/bot")
+            .base_file_url(f"{BOT_API_SERVER_URL}/file/bot")
+            .local_mode(False)
+        )
+        logger.info("Using Local Telegram Bot API: %s", BOT_API_SERVER_URL)
+    else:
+        logger.warning(
+            "TELEGRAM_BOT_API_URL is not set; using api.telegram.org "
+            "and large uploads will not work."
+        )
+
+    return builder.build()
+
+
+def main():
+    app = build_app()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
