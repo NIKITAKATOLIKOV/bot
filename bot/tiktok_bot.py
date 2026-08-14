@@ -6,6 +6,7 @@ import tempfile
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -23,42 +24,47 @@ REQUIRED_CHANNEL = "@thefencemusic"
 REQUIRED_CHANNEL_URL = "https://t.me/thefencemusic"
 
 
-async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if update.effective_user is None:
-        return False
+def has_confirmed_subscription(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    return bool(context.user_data.get("subscription_confirmed"))
 
-    try:
-        member = await context.bot.get_chat_member(
-            chat_id=REQUIRED_CHANNEL,
-            user_id=update.effective_user.id,
-        )
-        return member.status in {"member", "administrator", "creator"}
-    except Exception:
-        logger.exception(
-            "Не удалось проверить подписку пользователя %s на %s",
-            update.effective_user.id,
-            REQUIRED_CHANNEL,
-        )
-        return False
+
+async def ask_for_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Подписаться на канал ❤️‍🔥", url=REQUIRED_CHANNEL_URL)],
+            [InlineKeyboardButton("Я подписался ✅", callback_data="subscription_confirmed")],
+        ]
+    )
+
+    await update.effective_message.reply_text(
+        "Чтобы пользоваться ботом, подпишись на @thefencemusic ❤️‍🔥",
+        reply_markup=keyboard,
+    )
 
 
 async def require_subscription(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    if await is_subscribed(update, context):
+    if has_confirmed_subscription(context):
         return True
 
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Подписаться на канал", url=REQUIRED_CHANNEL_URL)]]
-    )
-    await update.message.reply_text(
-        "Чтобы пользоваться ботом, подпишись на @thefencemusic, "
-        "а потом отправь ссылку ещё раз.",
-        reply_markup=keyboard,
-    )
+    await ask_for_subscription(update, context)
     return False
 
+
+async def confirm_subscription(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    context.user_data["subscription_confirmed"] = True
+
+    await query.edit_message_text(
+        "Готово ❤️‍🔥 Теперь кидай ссылку на TikTok."
+    )
 
 
 # URL второго Railway-сервиса с Local Telegram Bot API.
@@ -266,6 +272,9 @@ def main():
     app = build_app()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", show_id))
+    app.add_handler(
+        CallbackQueryHandler(confirm_subscription, pattern="^subscription_confirmed$")
+    )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
