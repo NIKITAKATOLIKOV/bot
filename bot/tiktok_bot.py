@@ -114,6 +114,33 @@ def extract_tiktok_link(text: str) -> str | None:
     return match.group(0).rstrip(").,]}>\"'") if match else None
 
 
+TELEGRAM_CAPTION_LIMIT = 1024
+
+
+def fetch_tiktok_description(client: SnapTikClient, tiktok_url: str) -> str | None:
+    """Достаёт описание ролика через официальный oEmbed TikTok (без ключей)."""
+    url = tiktok_url
+    try:
+        # Короткие ссылки vm./vt.tiktok.com раскрываем в полную — oEmbed их не всегда понимает.
+        if re.search(r"//(?:vm|vt)\.tiktok\.com/", url, re.I):
+            r = client.session.get(url, allow_redirects=True, timeout=15)
+            url = r.url.split("?")[0]
+
+        r = client.session.get(
+            "https://www.tiktok.com/oembed",
+            params={"url": url},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        logger.warning("Не удалось получить описание TikTok: %s", e)
+        return None
+
+    title = (data.get("title") or "").strip()
+    return title or None
+
+
 def download_candidate(client: SnapTikClient, url: str, filepath: str) -> int:
     headers = {
         "Accept": "video/mp4,application/octet-stream,*/*;q=0.8",
@@ -181,6 +208,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _process_tiktok_link(update, status, client, tiktok_url):
+    description = await asyncio.to_thread(fetch_tiktok_description, client, tiktok_url)
+
     try:
         links = client.resolve(tiktok_url)
     except Exception as e:
@@ -222,6 +251,13 @@ async def _process_tiktok_link(update, status, client, tiktok_url):
                     f"Видео скачано: {size_mib:.1f} MiB. Отправляю в Telegram…"
                 )
 
+                if description and len(description) <= TELEGRAM_CAPTION_LIMIT:
+                    caption = description
+                    send_description_separately = False
+                else:
+                    caption = f"{size_mib:.2f} MiB"
+                    send_description_separately = bool(description)
+
                 with open(filepath, "rb") as video_file:
                     # read_file_handle=False: файл читается потоково сетевым
                     # бэкендом при отправке, а не загружается целиком в RAM.
@@ -232,12 +268,15 @@ async def _process_tiktok_link(update, status, client, tiktok_url):
                     )
                     await update.message.reply_document(
                         document=input_file,
-                        caption=f"SnapTik: {size_mib:.2f} MiB",
+                        caption=caption,
                         read_timeout=3600,
                         write_timeout=3600,
                         connect_timeout=60,
                         pool_timeout=60,
                     )
+
+                if send_description_separately:
+                    await update.message.reply_text(description)
 
                 await status.delete()
                 return
